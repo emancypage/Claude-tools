@@ -568,7 +568,14 @@ def main():
     window_h = cfg["window_hours"]
 
     ctx_total, ctx_cache_read, ctx_cache_create = ctx_tokens
-    ctx = fmt_tokens(ctx_total)
+    if ctx_total > 180_000:
+        ctx = f"\033[1;31m{fmt_tokens(ctx_total)}\033[0m"  # bold red - compact now
+    elif ctx_total > 120_000:
+        ctx = f"\033[31m{fmt_tokens(ctx_total)}\033[0m"  # red - should compact soon
+    elif ctx_total > 80_000:
+        ctx = f"\033[33m{fmt_tokens(ctx_total)}\033[0m"  # yellow - getting heavy
+    else:
+        ctx = f"\033[32m{fmt_tokens(ctx_total)}\033[0m"  # green - comfortable
     cache_pct = int((ctx_cache_read + ctx_cache_create) / ctx_total * 100) if ctx_total > 0 else 0
 
     # Time remaining from server or local
