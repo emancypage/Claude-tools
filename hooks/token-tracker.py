@@ -78,6 +78,8 @@ def parse_transcript(filepath):
             for line in f:
                 try:
                     data = json.loads(line)
+                    if not isinstance(data, dict):
+                        continue
                     if data.get("type") == "assistant" and "message" in data:
                         msg = data["message"]
                         usage = msg.get("usage", {})
