@@ -1,144 +1,201 @@
 # claude-tools
 
-Shared tools for working with Claude Code.
+Token usage tracker for Claude Code with real-time rate limit monitoring.
 
-## Token Usage Tracker
+## What it does
 
-Track token usage against the 5h and 7d rate limit windows. Shows status after every Claude response with **real server-side utilization data** from API response headers — no manual calibration needed.
+Two-part system that tracks your Claude Code usage against the 5h and 7d rate limit windows:
 
-### Installation
+- **StatusLine** — persistent bar always visible in Claude Code, including during responses
+- **Stop hook** — detailed usage breakdown printed after every response
+
+Both use **real server-side utilization data** from Claude Code's stdin JSON (requires Claude Code >= 2.1.80) — no API calls, no cost.
+
+## Installation
 
 ```bash
-git clone <repo-url> ~/claude-tools
-cd ~/claude-tools
+git clone <repo-url> ~/Dev/claude-tools
+cd ~/Dev/claude-tools
 ./install.sh
 ```
 
 `install.sh` creates symlinks to `~/.claude/`:
-- `hooks/token-tracker.py` — Stop hook (usage info after every response)
+- `statusline.py` — statusLine script (persistent bar + cache writer)
+- `hooks/token-tracker.py` — Stop hook + CLI
 - `commands/usage-calibrate.md` — `/usage-calibrate` slash command
 - `commands/usage-status.md` — `/usage-status` slash command
 
-You also need to add the Stop hook to your Claude Code settings. In a Claude Code conversation, ask:
+Then add both hooks to your Claude Code settings (`~/.claude/settings.json`):
 
-> "Add a Stop hook that runs `python3 ~/.claude/hooks/token-tracker.py`"
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python3 ~/.claude/statusline.py"
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/token-tracker.py"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
 
-### How it works
+## How it works
 
-After every Claude response, the Stop hook:
+### Dual-hook architecture
 
-1. Parses the current session transcript for weighted token usage
-2. Checks `~/.claude/rate-limit-cache.json` for server-side utilization data
-3. If the cache is stale (>5 min), makes a minimal API call (~1s, ~0 cost) to fetch fresh `anthropic-ratelimit-unified-5h-utilization` and `7d-utilization` headers
-4. Auto-updates `window_reset_at` and `window_budget` in the config
-5. Displays a compact status line
+```
+Claude Code stdin JSON
+  │
+  ├─► statusLine script
+  │     ├─ reads rate_limits from stdin (free, real-time)
+  │     ├─ writes to ~/.claude/rate-limit-cache.json
+  │     └─ displays persistent status bar
+  │
+  └─► Stop hook (after each response)
+        ├─ reads rate-limit-cache.json (no API call needed)
+        ├─ parses all .jsonl transcripts in the 5h window
+        ├─ computes weighted token usage across sessions/models
+        ├─ auto-calibrates window_budget from server utilization
+        └─ prints detailed usage line
+```
 
-The API probe uses haiku with `max_tokens=1` through the OAuth token stored by Claude Code. Cost per probe is negligible (<0.001% of the 5h budget).
+The statusLine script acts as the data source — it receives `rate_limits.five_hour.used_percentage` and `rate_limits.seven_day.used_percentage` from Claude Code's stdin JSON and writes them to a shared cache file. The Stop hook reads this cache instead of making its own API calls.
 
-### What you get
+### What you see
 
-The Stop hook shows a compact status after every response:
+**StatusLine** (always visible):
+
+```
+Opus 4.6 | ctx:16K(45%) | 5h:46% 0h36m ███████░░░░░░░░ | $0.15
+```
+
+- Model name
+- Context window size (color-coded: green < 80K, yellow < 120K, red < 180K, bold red >= 180K)
+- 5h rate limit with progress bar and time until reset
+- 7d rate limit (only shown if > 50%)
+- Session cost
+
+**Stop hook** (after each response):
 
 ```
 [usage] ctx: 125K (cache: 87%) | session: 12.8% | 1h25m left: 47.0%S ████████████████████░░░░░░░░░░
 ```
 
-- `ctx` — current context window size (input tokens in last API call)
-- `cache` — % of context served from prompt cache
-- `session` — this session's share of the 5h budget (local estimate)
+- `ctx` — current context window size with cache hit rate
+- `session` — this session's share of the 5h budget (weighted local estimate)
 - `47.0%S` — total 5h window usage from server (`S` = server, `L` = local fallback)
-- progress bar — visual representation of 5h window usage
+- Progress bar
 
-Use `/usage-status` for a detailed view:
+Use `/usage-status` for a detailed breakdown:
 
 ```
 5h window: 47.0% used  (allowed)
   Resets:  1h 26m until reset (13:00)
 7d window: 14.0% used  (allowed)
   Resets:  Apr 19
-Overage:   rejected (org_level_disabled)
 Source:    server (fetched 11:33:22)
 Budget:    81.5M weighted
 Auto-cal:  2026-04-13T11:33
 ```
 
+## Key features
+
+### Weighted token math
+
+Not all tokens cost the same against your rate limit:
+
+- **Model multipliers**: Opus 5x, Sonnet 1x, Haiku 0.2x
+- **Token weights**: input 1x, cache_create 1.25x, cache_read 0.1x, output 5x
+
+An Opus session burns through your budget 5x faster than Sonnet — this tool reflects that.
+
+### Cross-session aggregation
+
+Scans all `.jsonl` transcript files within the 5h window, not just the current session. If you ran 3 sessions in the last hour, all of them count.
+
 ### Auto-calibration
 
-The tracker automatically calibrates itself using server-side data:
+Automatically adjusts `window_budget` using the formula:
 
-- **`window_reset_at`** — set from the `5h-reset` API header (exact server time)
-- **`window_budget`** — computed as `local_weighted_tokens / server_utilization`
+```
+window_budget = local_weighted_tokens / server_utilization
+```
 
-This replaces the old manual workflow of checking claude.ai/settings/usage. Calibration happens silently every time the cache refreshes.
+Triggers when drift exceeds 5%. Also auto-updates `window_reset_at` from server data.
 
 ### Manual calibration (optional)
 
-If you don't have an active OAuth session or want to override, manual calibration still works:
+If server data is unavailable or you want to override:
 
 1. Go to [claude.ai/settings/usage](https://claude.ai/settings/usage)
 2. Note the **usage %** and **time until reset**
 3. In Claude Code: `/usage-calibrate 14 3h7m`
 
-### CLI usage
+## CLI usage
 
-The hook script also works standalone:
+The Stop hook script also works standalone:
 
 ```bash
-# Show status (fetches fresh server data)
+# Show detailed status
 python3 ~/.claude/hooks/token-tracker.py status
 
-# Force-refresh server data and print JSON
+# Read cached server data as JSON
 python3 ~/.claude/hooks/token-tracker.py refresh
 
 # Manual calibration
 python3 ~/.claude/hooks/token-tracker.py calibrate 14 3h7m
 ```
 
-### What it tracks
+## What it doesn't track
 
-- **Server-side**: real utilization % for 5h and 7d windows, reset times, overage status
-- **Locally**: per-session token breakdown, context window size, cache hit rate
-- Token weights: input x1, cache_create x1.25, cache_read x0.1, output x5
-- Model multipliers: Opus x5, Sonnet x1, Haiku x0.2
+Browser sessions (claude.ai), other machines, desktop app — but the server-side % includes all of these, so the window total is accurate regardless.
 
-### What it doesn't track
-
-- Browser sessions (claude.ai), other machines, desktop app — but the server-side % includes all of these, so the window total is accurate regardless
-
-### Configuration
+## Configuration
 
 `~/.claude/token-tracker.json` (created automatically):
 
 ```json
 {
   "window_hours": 5,
-  "window_budget": 81537390,
+  "window_budget": 82674925,
   "manual_usage": [],
-  "window_reset_at": "2026-04-13T13:00:00",
-  "_auto_calibrated": "2026-04-13T11:33:14"
+  "window_reset_at": "2026-04-16T01:00:00",
+  "_auto_calibrated": "2026-04-16T00:33:14"
 }
 ```
 
-- `window_budget` — auto-calibrated from server data, or set by `/usage-calibrate`
-- `window_reset_at` — auto-updated from server, or set by `/usage-calibrate`
-- `manual_usage` — optional manual entries for edge cases:
+- `window_budget` — auto-calibrated from server data, or set manually via `/usage-calibrate`
+- `window_reset_at` — auto-updated from server data
+- `manual_usage` — optional entries for usage outside Claude Code CLI:
   ```json
-  [{"ts": "2026-04-13T16:00:00", "weighted": 5000000, "note": "webUI"}]
+  [{"ts": "2026-04-13T16:00:00", "weighted": 5000000, "note": "webUI session"}]
   ```
 
-### Caveats
+## Caveats
 
-- The OAuth token (`~/.claude/.credentials.json`) and the `utilization` response headers are internal to Claude Code — not a public API. They may change without notice. If they break, the hook falls back to local estimates silently.
-- The API probe adds ~1s latency once every 5 minutes. The rest of the time it reads from cache.
-- Requires Python 3.8+ (uses `urllib.request`, no external dependencies).
+- The `rate_limits` field in Claude Code's statusLine stdin JSON is not a public API — it may change without notice. If unavailable, the Stop hook falls back to local estimates.
+- Requires Python 3.8+ (stdlib only, no external dependencies).
+- Requires Claude Code >= 2.1.80 for rate limit data in statusLine stdin.
 
 ## Structure
 
 ```
 claude-tools/
+├── statusline/statusline.py           # StatusLine script (persistent bar + cache writer)
 ├── hooks/token-tracker.py             # Stop hook + CLI (status, refresh, calibrate)
 ├── commands/usage-calibrate.md        # /usage-calibrate slash command
 ├── commands/usage-status.md           # /usage-status slash command
 ├── install.sh                         # Setup (symlinks to ~/.claude/)
+├── COMPARISON.md                      # Competitive comparison with GitHub alternatives
 └── README.md
 ```
