@@ -13,6 +13,10 @@ mkdir -p ~/.claude/hooks ~/.claude/commands
 ln -sf "$REPO_DIR/hooks/token-tracker.py" ~/.claude/hooks/token-tracker.py
 echo "  hooks/token-tracker.py -> ~/.claude/hooks/"
 
+# Symlink statusline
+ln -sf "$REPO_DIR/statusline/statusline.py" ~/.claude/statusline.py
+echo "  statusline/statusline.py -> ~/.claude/statusline.py"
+
 # Symlink slash commands
 for cmd in "$REPO_DIR"/commands/*.md; do
     [ -f "$cmd" ] || continue
@@ -41,6 +45,11 @@ if [ -f "$SETTINGS" ]; then
         echo
         echo "  NOTE: Add the Stop hook to your Claude Code settings."
         echo "  In Claude Code, ask: 'add a Stop hook that runs python3 ~/.claude/hooks/token-tracker.py'"
+    fi
+    if ! grep -q "statusline.py" "$SETTINGS" 2>/dev/null; then
+        echo
+        echo "  NOTE: Add the statusLine to your Claude Code settings."
+        echo "  Add to settings.json: \"statusLine\": {\"type\": \"command\", \"command\": \"python3 ~/.claude/statusline.py\"}"
     fi
 else
     echo

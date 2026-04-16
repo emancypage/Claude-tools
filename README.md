@@ -9,8 +9,8 @@ Track token usage against the 5h and 7d rate limit windows. Shows status after e
 ### Installation
 
 ```bash
-git clone <repo-url> ~/Dev/claude-tools
-cd ~/Dev/claude-tools
+git clone <repo-url> ~/claude-tools
+cd ~/claude-tools
 ./install.sh
 ```
 

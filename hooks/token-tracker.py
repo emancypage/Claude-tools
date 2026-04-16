@@ -1,29 +1,25 @@
 #!/usr/bin/env python3
 """Claude Code Stop hook: shows token usage as % of 5h rate limit after every response.
 
-Uses real server-side utilization data from API response headers
-(anthropic-ratelimit-unified-5h-utilization, 7d-utilization) cached locally.
-Falls back to local weighted token estimates when server data is unavailable.
+Reads server-side rate limit data from cache (written by the statusLine script
+which gets it for free from Claude Code's stdin JSON). Falls back to local
+weighted token estimates when cache is unavailable.
 """
 
 import json
 import sys
 import os
 import time
-import urllib.request
-import urllib.error
 from pathlib import Path
 from datetime import datetime, timedelta
 
 CONFIG_PATH = Path.home() / ".claude" / "token-tracker.json"
 CACHE_PATH = Path.home() / ".claude" / "token-tracker-cache.json"
 RATELIMIT_CACHE_PATH = Path.home() / ".claude" / "rate-limit-cache.json"
-CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 DEFAULT_WINDOW_HOURS = 5
 DEFAULT_WINDOW_BUDGET = 40_000_000
-RATELIMIT_CACHE_TTL = 300  # refresh server data every 5 minutes
 
 # Cost weights (proportional to API pricing ratios, consistent across models)
 WEIGHT_INPUT = 1.0
@@ -168,80 +164,7 @@ def progress_bar(pct, width=20):
     return "\u2588" * filled + "\u2591" * (width - filled)
 
 
-# --- Server-side rate limit data ---
-
-
-def _get_access_token():
-    """Read OAuth access token from credentials file."""
-    try:
-        with open(CREDENTIALS_PATH) as f:
-            creds = json.load(f)
-        return creds.get("claudeAiOauth", {}).get("accessToken")
-    except (OSError, json.JSONDecodeError, KeyError):
-        return None
-
-
-def fetch_server_ratelimit():
-    """Make a minimal API call and return rate limit headers.
-
-    Uses haiku with max_tokens=1 to minimize cost (~$0.001).
-    Returns dict with 5h/7d utilization data, or None on failure.
-    """
-    token = _get_access_token()
-    if not token:
-        return None
-
-    body = json.dumps({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "x"}],
-    }).encode()
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
-        headers={
-            "X-Api-Key": token,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            headers = resp.headers
-            result = {"ts": time.time()}
-
-            for key, prefix in [("5h", "5h"), ("7d", "7d")]:
-                util = headers.get(f"anthropic-ratelimit-unified-{prefix}-utilization")
-                reset = headers.get(f"anthropic-ratelimit-unified-{prefix}-reset")
-                status = headers.get(f"anthropic-ratelimit-unified-{prefix}-status")
-                if util is not None and reset is not None:
-                    result[key] = {
-                        "utilization": float(util),
-                        "reset": int(reset),
-                        "status": status or "unknown",
-                    }
-
-            result["representative_claim"] = headers.get(
-                "anthropic-ratelimit-unified-representative-claim", ""
-            )
-            result["overage_status"] = headers.get(
-                "anthropic-ratelimit-unified-overage-status", ""
-            )
-            result["overage_reason"] = headers.get(
-                "anthropic-ratelimit-unified-overage-disabled-reason", ""
-            )
-            result["fallback_pct"] = headers.get(
-                "anthropic-ratelimit-unified-fallback-percentage", ""
-            )
-            result["status"] = headers.get(
-                "anthropic-ratelimit-unified-status", ""
-            )
-            return result
-    except (urllib.error.URLError, OSError, ValueError):
-        return None
+# --- Server-side rate limit data (read from cache written by statusLine) ---
 
 
 def load_ratelimit_cache():
@@ -253,34 +176,19 @@ def load_ratelimit_cache():
         return None
 
 
-def save_ratelimit_cache(data):
-    try:
-        with open(RATELIMIT_CACHE_PATH, "w") as f:
-            json.dump(data, f, indent=2)
-    except OSError:
-        pass
+def get_server_ratelimit():
+    """Read rate limit data from cache (written by statusLine script).
 
+    The statusLine script receives rate_limits in its stdin JSON from
+    Claude Code (since v2.1.80) and writes it to the cache file. This
+    avoids the need for any API calls from the Stop hook.
 
-def get_server_ratelimit(force_refresh=False):
-    """Get rate limit data, refreshing if cache is stale.
-
-    Returns cached data if fresh (< RATELIMIT_CACHE_TTL seconds old),
-    otherwise fetches from API. Returns None if unavailable.
+    Returns cached data, or None if unavailable.
     """
     cached = load_ratelimit_cache()
-    if not force_refresh and cached:
-        age = time.time() - cached.get("ts", 0)
-        if age < RATELIMIT_CACHE_TTL:
-            return cached
-
-    fresh = fetch_server_ratelimit()
-    if fresh:
-        save_ratelimit_cache(fresh)
-        # Also auto-update window_reset_at in config
-        _auto_update_config(fresh)
-        return fresh
-
-    return cached  # stale cache is better than nothing
+    if cached:
+        _auto_update_config(cached)
+    return cached
 
 
 def _auto_update_config(server_data):
@@ -414,9 +322,9 @@ def calibrate(real_pct, time_remaining=None):
 
 
 def status():
-    """Show current usage status with server-side data."""
+    """Show current usage status with cached server-side data."""
     cfg = load_config()
-    server = get_server_ratelimit(force_refresh=True)
+    server = get_server_ratelimit()
 
     if server and "5h" in server:
         h5 = server["5h"]
@@ -498,13 +406,12 @@ def main():
         calibrate(pct, time_remaining)
         return
     if len(sys.argv) >= 2 and sys.argv[1] == "refresh":
-        data = fetch_server_ratelimit()
+        data = load_ratelimit_cache()
         if data:
-            save_ratelimit_cache(data)
             _auto_update_config(data)
             print(json.dumps(data, indent=2))
         else:
-            print("Failed to fetch server data", file=sys.stderr)
+            print("No cached rate limit data. Data is written by the statusLine script.", file=sys.stderr)
             sys.exit(1)
         return
 
@@ -555,8 +462,8 @@ def main():
 
     session_pct = (session_weighted / budget * 100) if budget > 0 else 0
 
-    # Get server data (cached, refreshed if stale)
-    server = get_server_ratelimit(force_refresh=False)
+    # Get server data from cache (written by statusLine script)
+    server = get_server_ratelimit()
 
     # Prefer server-side percentage, fall back to local estimate
     if server and "5h" in server:
